@@ -1,0 +1,166 @@
+name: Release
+
+# Publishes the image a self-hoster runs, so they do not have to build it. Tag
+# driven: pushing v1.2.3 publishes 1.2.3, 1.2, 1 and latest, which is what lets
+# someone pin as loosely or as tightly as they want.
+#
+# The name keeps its -pocketbase suffix from when the frontend shipped as a
+# second image. Renaming it would strand everyone whose compose file names the
+# old one, which is a worse trade than a suffix that no longer distinguishes
+# anything.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish the image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Sign in to the registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}-pocketbase
+          # v-prefixed so an image tag is the git tag, verbatim. metadata-action
+          # strips the v by default, which makes MEDIA_TRACKER_VERSION=v0.1.0 a
+          # 404 against a registry holding 0.1.0.
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+          labels: |
+            org.opencontainers.image.title=Simple Media Tracker
+            org.opencontainers.image.description=A minimal, self-hosted tracker for movies, shows, games, books, anime and manga.
+            org.opencontainers.image.licenses=MIT
+
+      # The heavy stages build on the runner's own architecture — the frontend
+      # is static files and the PocketBase stage only downloads a binary — so
+      # arm64 costs a layer copy rather than a run under emulation.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: pocketbase
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  verify:
+    name: The published image starts and serves
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # This job pulls the image like any other client would. The package is
+      # public, so an anonymous pull works today — but a fork's packages are
+      # private, so without this the job fails with `unauthorized` rather than
+      # a real result.
+      - name: Sign in to the registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # An image that pushes but does not run is worse than no image at all, so
+      # pull the tag that was just published and prove the stack comes up.
+      - name: Run the published stack
+        env:
+          MEDIA_TRACKER_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p pb_data
+          # PocketBase runs as PUID:PGID (default 1000:1000) and pb_data is
+          # owned by whoever just created it — the runner's own account, not
+          # necessarily uid 1000. Mismatched, PocketBase can't open its
+          # database, fails its healthcheck, and this job never gets past
+          # "unhealthy" to tell you anything about the image itself. Set
+          # them to match, exactly as the README tells a self-hoster to when
+          # 1000:1000 is not their own uid.
+          PUID="$(id -u)" PGID="$(id -g)" docker compose -f compose.ghcr.yaml up -d --wait --wait-timeout 180
+
+      # One port, one container: the same origin answers for the frontend and
+      # for the REST API.
+      - name: Check it serves the app and the API
+        run: |
+          set -euo pipefail
+          curl -fsS -o /dev/null http://127.0.0.1:8090/
+          curl -fsS http://127.0.0.1:8090/api/collections/media_entries/records | head -c 200
+          echo
+          echo "the published image serves the app and the API"
+
+      - name: Logs if anything failed
+        if: failure()
+        run: docker compose -f compose.ghcr.yaml logs --tail=50
+
+  notes:
+    name: Publish the release notes
+    needs: verify
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # The CHANGELOG is the release notes. Each GitHub release carries its own
+      # entry, so watching the repository's releases is how a self-hoster hears
+      # there is something to pull, and "when the release notes mention the
+      # compose file" in the README names something that exists. A tag with no
+      # entry fails here, after the image is published, rather than shipping a
+      # release that says nothing.
+      - name: Take this version's entry from the CHANGELOG
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY' > notes.md
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          entry = re.search(r"^## \[" + re.escape(version) + r"\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]: |\Z)", text, re.M | re.S)
+          if entry is None:
+              sys.exit(f"CHANGELOG.md has no entry for {version}; add one before tagging")
+          print(entry.group(1).strip())
+          PY
+          cat notes.md
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          fi

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+pb_data/
+.env
+.env.local
+*.log
+pocketbase
+pocketbase.exe
+ci_pb_data/
+.vitest/

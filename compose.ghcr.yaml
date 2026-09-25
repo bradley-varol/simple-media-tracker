@@ -1,0 +1,46 @@
+# Runs Simple Media Tracker from a published image, without a source checkout.
+# This file is self-contained. Save it as compose.yaml in an empty directory,
+# create pb_data beside it, and start. The README prints it in full as well, so
+# it can be pasted instead of downloaded.
+#
+#   mkdir -p pb_data
+#   docker compose up -d
+#
+# Pin a version rather than tracking latest on anything you care about:
+#
+#   MEDIA_TRACKER_VERSION=v1.0.0 docker compose up -d
+#
+# The frontend and the schema both live inside the image and apply on start, so
+# there is nothing else to fetch. Everything else — ports, PUID/PGID, exposing
+# it to the internet — works exactly as described in the README.
+
+services:
+  pocketbase:
+    image: ghcr.io/bradley-varol/simple-media-tracker-pocketbase:${MEDIA_TRACKER_VERSION:-latest}
+    # Loopback by default. Note that this port also serves the superuser
+    # dashboard at /_/, which has full database access: before publishing it
+    # anywhere, restrict the dashboard to the addresses you use it from with
+    # `superuser ips` — see the README.
+    ports:
+      - "${WEB_PUBLISH:-127.0.0.1:8090}:8091"
+    volumes:
+      # Long syntax so create_host_path can be turned off: a missing ./pb_data
+      # would otherwise be created by Docker as root, which this container runs
+      # too unprivileged to write. Being told the directory is missing beats
+      # debugging a database that will not open.
+      - type: bind
+        source: ./pb_data
+        target: /pb_data
+        bind:
+          create_host_path: false
+    # Must match the owner of ./pb_data on the host. `id -u` / `id -g`.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8091/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped

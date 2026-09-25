@@ -1,0 +1,67 @@
+{
+  "name": "simple-media-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A minimal, easy to use, self-hosted media tracker for the movies, shows, games, books, anime and manga you've finished. No metadata lookups, no artwork, no recommendations.",
+  "license": "MIT",
+  "author": "Bradley Varol",
+  "homepage": "https://github.com/bradley-varol/simple-media-tracker#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bradley-varol/simple-media-tracker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bradley-varol/simple-media-tracker/issues"
+  },
+  "keywords": [
+    "media-tracker",
+    "self-hosted",
+    "pocketbase",
+    "react",
+    "vite",
+    "movies",
+    "shows",
+    "games",
+    "books",
+    "anime",
+    "manga"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:host": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit --pretty false",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "preview": "vite preview",
+    "pocketbase": "bash scripts/pocketbase-dev.sh",
+    "pocketbase:fetch": "bash scripts/fetch-pocketbase.sh",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "class-variance-authority": "^0.7.1",
+    "cmdk": "^1.1.1",
+    "cn": "^0.4.0",
+    "lucide-react": "^1.47.0",
+    "pocketbase": "^0.28.1",
+    "radix-ui": "^1.6.7",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.13.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.85.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  }
+}

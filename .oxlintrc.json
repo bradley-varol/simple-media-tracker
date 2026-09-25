@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["dist", "pb_data", "node_modules"],
+  "plugins": ["react", "typescript", "oxc"],
+  "env": {
+    "browser": true,
+    "es2022": true
+  },
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/exhaustive-deps": "warn",
+    "eqeqeq": "error",
+    "no-console": "warn",
+
+    "react/react-in-jsx-scope": "off",
+
+    "react/set-state-in-effect": "warn",
+
+    "no-underscore-dangle": "off"
+  },
+  "overrides": [
+    {
+      "files": ["pb_migrations/*.js"],
+      "env": { "browser": false },
+      "globals": {
+        "migrate": "readonly",
+        "Collection": "readonly",
+        "$app": "readonly"
+      }
+    }
+  ]
+}

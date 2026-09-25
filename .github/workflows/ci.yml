@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # .nvmrc rather than a version here, so CI and a contributor's shell can
+      # never disagree about which Node this builds on.
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run build
+
+  migrations:
+    name: Migrations apply to a fresh database
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The schema is only real if it applies from nothing. This job also
+      # asserts the access rules that make hidden entries private, so the app
+      # can never ship a privacy promise that the database does not enforce.
+      - name: Resolve the pinned PocketBase version
+        id: pb
+        run: |
+          version="$(grep -m1 '^ARG POCKETBASE_VERSION=' Dockerfile | cut -d= -f2)"
+          test -n "$version" || { echo "POCKETBASE_VERSION not found in Dockerfile" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download PocketBase
+        run: |
+          set -euo pipefail
+          version="${{ steps.pb.outputs.version }}"
+          archive="pocketbase_${version}_linux_amd64.zip"
+          base="https://github.com/pocketbase/pocketbase/releases/download/v${version}"
+          curl -fsSL -o "$archive" "$base/$archive"
+          curl -fsSL -o checksums.txt "$base/checksums.txt"
+          grep " $archive\$" checksums.txt | sha256sum -c -
+          unzip -q "$archive" pocketbase
+          chmod +x pocketbase
+
+      - name: Apply migrations
+        run: ./pocketbase migrate up --dir ./ci_pb_data --migrationsDir ./pb_migrations
+
+      - name: Assert the resulting schema and access rules
+        run: |
+          python3 - <<'PY'
+          import json, sqlite3, sys
+
+          db = sqlite3.connect("ci_pb_data/data.db")
+          row = db.execute(
+              "select fields, listRule, viewRule, createRule, updateRule, deleteRule"
+              " from _collections where name = 'media_entries'"
+          ).fetchone()
+          if row is None:
+              sys.exit("media_entries collection was not created")
+
+          fields, list_rule, view_rule, create_rule, update_rule, delete_rule = row
+          names = {f["name"] for f in json.loads(fields)}
+          failures = []
+
+          for field in ["type", "title", "status", "date_finished", "rating", "hidden", "parent", "deleted", "created", "updated"]:
+              if field not in names:
+                  failures.append(f"missing field: {field}")
+
+          # Guests never see a deleted entry, and nothing but the Recently
+          # deleted routes may set `deleted` or remove an entry outright, so the
+          # delete rule stays closed to everyone but superusers.
+          read_rule = '@request.auth.id != "" || (@collection.app_settings.guestViewing = true && hidden = false && deleted = "" && @collection.app_settings.guestHiddenTypes:each != type)'
+          write_rule = '@request.auth.id != "" && @request.body.deleted:isset = false'
+          for label, actual, expected in [
+              ("list", list_rule, read_rule),
+              ("view", view_rule, read_rule),
+              ("create", create_rule, write_rule),
+              ("update", update_rule, write_rule),
+              ("delete", delete_rule, None),
+          ]:
+              if actual != expected:
+                  failures.append(f"{label}Rule is {actual!r}, expected {expected!r}")
+
+          users = db.execute("select createRule from _collections where name = 'users'").fetchone()
+          if users is None or users[0] is not None:
+              failures.append(f"users createRule is {users and users[0]!r}, expected null (registration closed)")
+
+          settings = json.loads(db.execute("select value from _params where id = 'settings'").fetchone()[0])
+          if not settings["rateLimits"]["enabled"]:
+              failures.append("rate limiting is not enabled")
+
+          # Nothing proxies in front of PocketBase by default, so a forwarded IP
+          # header is whatever the client chose to send — and that header picks
+          # the rate limit bucket and gates the superuser dashboard.
+          if settings["trustedProxy"]["headers"]:
+              failures.append(
+                  f"trustedProxy trusts {settings['trustedProxy']['headers']}, expected nothing")
+
+          # Public viewing has to start on, or upgrading an existing instance
+          # would silently take its library offline.
+          guest = db.execute("select guestViewing from app_settings").fetchone()
+          if guest is None or not guest[0]:
+              failures.append("guestViewing does not default to on")
+
+          # Likewise nothing may be hidden by type until the owner chooses, or
+          # upgrading would silently take part of the library away from guests.
+          hidden_types = db.execute("select guestHiddenTypes from app_settings").fetchone()
+          if hidden_types is None or json.loads(hidden_types[0] or "[]") != []:
+              failures.append(f"guestHiddenTypes is {hidden_types and hidden_types[0]!r}, expected []")
+
+          if failures:
+              sys.exit("\n".join(failures))
+          print("schema, access rules, rate limits and proxy trust verified")
+          PY
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Builds the frontend into the image too, so this covers both halves of
+      # what ships. Also proves the pinned PocketBase checksum is correct.
+      - name: Build the application image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: pocketbase
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  compose:
+    name: Compose files and the README agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Every compose file is valid
+        run: |
+          set -euo pipefail
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.ghcr.yaml config --quiet
+          docker compose -f compose.dev.yaml config --quiet
+
+      # The README prints compose.ghcr.yaml in full so a self-hoster can paste
+      # it rather than download it, and the Unraid section prints the same file
+      # with its three host details filled in. Both are copies, and a copy of a
+      # compose file rots silently: it still parses, it just stops matching what
+      # ships. Compare them rather than trusting whoever edits one to edit both.
+      - name: The README compose blocks match compose.ghcr.yaml
+        run: |
+          python3 - <<'PY'
+          import difflib, pathlib, sys
+
+          readme = pathlib.Path("README.md").read_text()
+          compose = pathlib.Path("compose.ghcr.yaml").read_text()
+          services = compose[compose.index("services:"):]
+
+          def block_after(anchor):
+              start = readme.find(anchor)
+              if start < 0:
+                  sys.exit("could not find the README block introduced by:\n  " + anchor.strip())
+              start += len(anchor)
+              return readme[start:readme.index("```", start)]
+
+          # The Unraid block is the same file with the host-specific details
+          # filled in. Change these alongside the README when either moves.
+          unraid = (services
+              .replace('"${WEB_PUBLISH:-127.0.0.1:8090}:8091"', '"0.0.0.0:8090:8091"')
+              .replace("source: ./pb_data", "source: /mnt/user/appdata/simple-media-tracker")
+              .replace('user: "${PUID:-1000}:${PGID:-1000}"', 'user: "99:100"')
+              .replace("    # Must match the owner of ./pb_data on the host. `id -u` / `id -g`.\n",
+                       "    # 99:100 is nobody:users, which owns appdata on Unraid.\n"))
+
+          blocks = [
+              ("quick start", "Save this as `compose.yaml` beside that `pb_data` directory:\n\n```yaml\n", services),
+              ("Unraid", "Paste this in as its compose file, then bring the stack up.\n\n```yaml\n", unraid),
+          ]
+
+          failures = []
+          for label, anchor, expected in blocks:
+              actual = block_after(anchor)
+              if actual != expected:
+                  diff = difflib.unified_diff(
+                      expected.splitlines(), actual.splitlines(),
+                      "compose.ghcr.yaml", "README.md (" + label + ")", lineterm="")
+                  failures.append(
+                      "the " + label + " block has drifted from compose.ghcr.yaml:\n"
+                      + "\n".join(diff))
+
+          if failures:
+              sys.exit("\n\n".join(failures))
+          print("the README compose blocks match compose.ghcr.yaml")
+          PY
